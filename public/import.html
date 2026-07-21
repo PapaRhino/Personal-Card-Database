@@ -140,49 +140,156 @@ async function getTcgdexSets() {
   return tcgdexSets
 }
 
+function deaccent(str) {
+  return (str || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+}
+
+async function searchTcgdexByName(name) {
+  const res = await fetch(`https://api.tcgdex.net/v2/en/cards?name=${encodeURIComponent(name)}`)
+  const results = res.ok ? await res.json() : []
+  if (results.length) return results
+
+  // Collectr strips accents from card names (e.g. "Pokemon Trader" vs the real
+  // "Pokémon Trader", "Pokedex" vs "Pokédex"). TCGdex's search is a literal substring
+  // match, so the accent-free query finds nothing. Retry with a short accent-safe
+  // prefix, then filter accent-insensitively once results come back.
+  const prefix = name.slice(0, 3)
+  if (prefix.length < 3) return []
+  const retryRes = await fetch(`https://api.tcgdex.net/v2/en/cards?name=${encodeURIComponent(prefix)}`)
+  return retryRes.ok ? await retryRes.json() : []
+}
+
 function setNameFromCardId(cardId, sets) {
   const setId = cardId.split('-').slice(0, -1).join('-')
   const set = sets.find((s) => s.id === setId)
   return set ? set.name : setId
 }
 
-async function matchPokemon(row) {
-  const sets = await getTcgdexSets()
+function topSetMatches(targetName, sets, n) {
+  const target = normalizeSetName(targetName)
+  return sets
+    .map((s) => ({ set: s, score: levenshtein(target, normalizeSetName(s.name)) }))
+    .sort((a, b) => a.score - b.score)
+    .slice(0, n)
+    .map((x) => x.set)
+}
+
+function dedupeById(list) {
+  const seen = new Set()
+  return list.filter((item) => {
+    if (seen.has(item.id)) return false
+    seen.add(item.id)
+    return true
+  })
+}
+
+// Strategy 1: search by name across all sets, disambiguate using the card number.
+async function matchByNameGlobal(row, sets) {
   const rawNum = (row['Card Number'] || '').split('/')[0].trim()
   const numNoLeadingZeros = rawNum.replace(/^0+(?=\d)/, '')
-  const nameLower = (row['Product Name'] || '').toLowerCase()
+  const nameTarget = deaccent(row['Product Name'] || '').toLowerCase()
 
-  const searchRes = await fetch(`https://api.tcgdex.net/v2/en/cards?name=${encodeURIComponent(row['Product Name'])}`)
-  if (!searchRes.ok) return { status: 'nomatch' }
-  const results = await searchRes.json()
+  const results = await searchTcgdexByName(row['Product Name'])
+  if (!results.length) return {}
 
-  const sameName = results.filter((c) => c.name.toLowerCase() === nameLower)
+  const sameName = results.filter((c) => deaccent(c.name).toLowerCase() === nameTarget)
   const pool = sameName.length ? sameName : results
-  if (!pool.length) return { status: 'nomatch' }
+  if (!pool.length) return {}
 
-  // The card number is the most reliable signal Collectr gives us — prefer it over set-name text.
   const numberMatches = pool.filter((c) => c.localId === rawNum || c.localId === numNoLeadingZeros)
   const finalPool = numberMatches.length ? numberMatches : pool
 
-  if (finalPool.length === 1) {
-    return { status: 'matched', ...(await resolvePokemonCardById(finalPool[0].id)) }
-  }
+  if (finalPool.length === 1) return { matched: finalPool[0] }
 
-  // Same name + same number across multiple sets is rare, but if it happens, use the
-  // Collectr set text as a tiebreaker rather than asking for manual review every time.
   const setGuess = bestSetMatch(row['Set'], sets, (s) => s.name)
   const preferred = setGuess && finalPool.find((c) => c.id.startsWith(setGuess.id + '-'))
-  if (preferred) {
-    return { status: 'matched', ...(await resolvePokemonCardById(preferred.id)) }
+  if (preferred) return { matched: preferred }
+
+  return { candidates: finalPool }
+}
+
+// Strategy 2: fuzzy-match the Collectr set text, then look inside that specific set.
+// Catches cases the name search misses entirely (e.g. TCGdex search quirks, unusual names).
+async function matchBySetName(row, sets) {
+  const rawNum = (row['Card Number'] || '').split('/')[0].trim()
+  const numNoLeadingZeros = rawNum.replace(/^0+(?=\d)/, '')
+  const nameTarget = deaccent(row['Product Name'] || '').toLowerCase()
+  const candidates = []
+
+  for (const setGuess of topSetMatches(row['Set'], sets, 3)) {
+    const setRes = await fetch(`https://api.tcgdex.net/v2/en/sets/${setGuess.id}`)
+    if (!setRes.ok) continue
+    const setData = await setRes.json()
+
+    const byNumber = setData.cards.find((c) => c.localId === rawNum || c.localId === numNoLeadingZeros)
+    if (byNumber) return { matched: byNumber }
+
+    const byName = setData.cards.filter((c) => deaccent(c.name).toLowerCase() === nameTarget)
+    if (byName.length === 1) return { matched: byName[0] }
+    candidates.push(...byName)
   }
 
-  return {
-    status: 'review',
-    candidates: finalPool.slice(0, 20).map((c) => ({
-      label: `${c.name} — ${setNameFromCardId(c.id, sets)} #${c.localId}`,
-      resolve: () => resolvePokemonCardById(c.id),
-    })),
+  return candidates.length ? { candidates } : {}
+}
+
+// Strategy 3: search by card number across all sets, then fuzzy-match name/set to pick the right one.
+// Catches cases where the name itself is garbled but the number is reliable.
+async function matchByNumberGlobal(row, sets) {
+  const rawNum = (row['Card Number'] || '').split('/')[0].trim()
+  const numNoLeadingZeros = rawNum.replace(/^0+(?=\d)/, '')
+  const nameTarget = deaccent(row['Product Name'] || '').toLowerCase()
+  if (!rawNum) return {}
+
+  const queries = [...new Set([rawNum, numNoLeadingZeros].filter(Boolean))]
+  const resultSets = await Promise.all(
+    queries.map((q) =>
+      fetch(`https://api.tcgdex.net/v2/en/cards?localId=${encodeURIComponent(q)}`).then((r) => (r.ok ? r.json() : []))
+    )
+  )
+  const merged = dedupeById(resultSets.flat())
+  const exactNumber = merged.filter((c) => c.localId === rawNum || c.localId === numNoLeadingZeros)
+  if (!exactNumber.length) return {}
+
+  const byName = exactNumber.filter((c) => deaccent(c.name).toLowerCase() === nameTarget)
+  const pool = byName.length ? byName : exactNumber
+
+  if (pool.length === 1) return { matched: pool[0] }
+
+  const setGuess = bestSetMatch(row['Set'], sets, (s) => s.name)
+  const preferred = setGuess && pool.find((c) => c.id.startsWith(setGuess.id + '-'))
+  if (preferred) return { matched: preferred }
+
+  return { candidates: pool }
+}
+
+async function matchPokemon(row) {
+  const sets = await getTcgdexSets()
+
+  const byName = await matchByNameGlobal(row, sets)
+  if (byName.matched) return { status: 'matched', ...(await resolvePokemonCardById(byName.matched.id)) }
+
+  const bySet = await matchBySetName(row, sets)
+  if (bySet.matched) return { status: 'matched', ...(await resolvePokemonCardById(bySet.matched.id)) }
+
+  const byNumber = await matchByNumberGlobal(row, sets)
+  if (byNumber.matched) return { status: 'matched', ...(await resolvePokemonCardById(byNumber.matched.id)) }
+
+  const merged = dedupeById([
+    ...(byName.candidates || []),
+    ...(bySet.candidates || []),
+    ...(byNumber.candidates || []),
+  ])
+  if (merged.length) {
+    return {
+      status: 'review',
+      candidates: merged.slice(0, 20).map((c) => ({
+        label: `${c.name} — ${setNameFromCardId(c.id, sets)} #${c.localId}`,
+        resolve: () => resolvePokemonCardById(c.id),
+      })),
+    }
   }
+
+  return { status: 'nomatch' }
 }
 
 async function resolvePokemonCardById(cardId) {
