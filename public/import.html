@@ -125,6 +125,11 @@ function bestSetMatch(targetName, sets, nameFn) {
     const score = levenshtein(target, normalizeSetName(nameFn(s)))
     if (score < bestScore) { bestScore = score; best = s }
   }
+  // Guard against forcing a nonsense pick: if even the closest set name is wildly
+  // different from the target text, treat it as no confident match rather than
+  // silently using whatever happened to score lowest.
+  const threshold = Math.max(4, Math.ceil(target.length * 0.5))
+  if (bestScore > threshold) return null
   return best
 }
 
@@ -364,16 +369,29 @@ async function matchYugioh(row) {
   // Collectr appends things like "(UR)" or "(Platinum Secret Rare)" onto the product
   // name for special prints — that's not the card's actual name, strip it before searching.
   const cleanName = (row['Product Name'] || '').replace(/\s*\([^)]*\)\s*$/, '').trim()
+  // Collectr sometimes "corrects" grammar, e.g. "Gradius's Option" vs the official
+  // "Gradius' Option" — try both forms.
+  const possessiveFix = cleanName.replace(/'s\b/g, "'")
+  const nameVariants = [...new Set([cleanName, possessiveFix])]
 
-  let card = await fetchYgoExact(cleanName)
+  let card = null
+  for (const variant of nameVariants) {
+    card = await fetchYgoExact(variant)
+    if (card) break
+  }
 
   if (!card) {
-    const candidates = await fetchYgoFuzzy(cleanName)
-    if (candidates.length === 1) card = candidates[0]
-    else if (candidates.length > 1) {
-      return {
-        status: 'review',
-        candidates: candidates.map((c) => ({ label: `${c.name} (${c.type})`, resolve: () => toYugiohResult(c, row) })),
+    for (const variant of nameVariants) {
+      const candidates = await fetchYgoFuzzy(variant)
+      if (candidates.length === 1) {
+        card = candidates[0]
+        break
+      }
+      if (candidates.length > 1) {
+        return {
+          status: 'review',
+          candidates: candidates.map((c) => ({ label: `${c.name} (${c.type})`, resolve: () => toYugiohResult(c, row) })),
+        }
       }
     }
   }
