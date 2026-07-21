@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TCG Archive — Bulk Import</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+  input, select, button { font-size: 1rem; padding: 0.4rem 0.6rem; }
+  button { cursor: pointer; border-radius: 6px; border: 1px solid #888; background: #f5f5f5; }
+  button:hover { background: #eee; }
+  button.primary { background: #2c6e49; color: white; border-color: #2c6e49; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th, td { border-bottom: 1px solid #eee; padding: 0.4rem; text-align: left; vertical-align: middle; }
+  img.thumb { width: 40px; border-radius: 4px; }
+  .status-matched { color: #2c6e49; font-weight: 600; }
+  .status-review { color: #b8860b; font-weight: 600; }
+  .status-nomatch { color: #b00020; font-weight: 600; }
+  #progress { font-size: 0.9rem; color: #555; margin: 0.5rem 0; }
+  select.candidate { max-width: 260px; }
+  #hidden-count { color: #777; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>TCG Archive — Bulk Import</h1>
+
+<div id="login-screen" class="card">
+  <h2 style="margin-top:0;">Admin PIN</h2>
+  <input type="password" id="pin-input" placeholder="PIN" />
+  <button class="primary" onclick="login()">Log in</button>
+  <p id="login-error" style="color:#b00020;"></p>
+</div>
+
+<div id="import-screen" class="card" style="display:none;">
+  <h2 style="margin-top:0;">1. Upload Collectr CSV</h2>
+  <input type="file" id="csv-file" accept=".csv" />
+  <button class="primary" onclick="startMatching()">Match all rows</button>
+  <div id="progress"></div>
+</div>
+
+<div id="results-screen" style="display:none;">
+  <div class="card">
+    <span id="hidden-count"></span>
+    <button class="primary" onclick="submitImport()" style="float:right;">Import matched rows →</button>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th></th><th>Image</th><th>Name</th><th>Game</th><th>Set</th><th>Variant</th><th>Qty</th><th>Status</th>
+      </tr>
+    </thead>
+    <tbody id="results-body"></tbody>
+  </table>
+</div>
+
+<div id="import-result" class="card" style="display:none;"></div>
+
+<script>
+const CATEGORY_TO_GAME = {
+  'Pokemon': 'pokemon',
+  'Lorcana': 'lorcana',
+  'Magic: The Gathering': 'mtg',
+  'YuGiOh': 'yugioh',
+}
+
+let parsedRows = []
+let matchedItems = []
+
+async function login() {
+  const pin = document.getElementById('pin-input').value
+  const res = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pin }),
+  })
+  if (res.ok) {
+    document.getElementById('login-screen').style.display = 'none'
+    document.getElementById('import-screen').style.display = 'block'
+  } else {
+    document.getElementById('login-error').textContent = 'Invalid PIN'
+  }
+}
+
+document.getElementById('csv-file')?.addEventListener('change', (e) => {
+  const file = e.target.files[0]
+  if (!file) return
+  Papa.parse(file, {
+    header: true,
+    skipEmptyLines: true,
+    complete: (results) => { parsedRows = results.data },
+  })
+})
+
+// ---------- string matching helpers ----------
+function normalizeSetName(s) {
+  return (s || '')
+    .replace(/\(.*?\)/g, '')
+    .replace(/\b(1st Edition|Shadowless|Unlimited)\b/gi, '')
+    .trim()
+    .toLowerCase()
+}
+
+function levenshtein(a, b) {
+  const m = a.length, n = b.length
+  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)])
+  for (let j = 0; j <= n; j++) dp[0][j] = j
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1])
+    }
+  }
+  return dp[m][n]
+}
+
+function bestSetMatch(targetName, sets, nameFn) {
+  const target = normalizeSetName(targetName)
+  let best = null, bestScore = Infinity
+  for (const s of sets) {
+    const score = levenshtein(target, normalizeSetName(nameFn(s)))
+    if (score < bestScore) { bestScore = score; best = s }
+  }
+  return best
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
+
+// ---------- Pokémon (TCGdex) ----------
+let tcgdexSets = null
+async function getTcgdexSets() {
+  if (!tcgdexSets) {
+    const res = await fetch('https://api.tcgdex.net/v2/en/sets')
+    tcgdexSets = await res.json()
+  }
+  return tcgdexSets
+}
+
+async function matchPokemon(row) {
+  const sets = await getTcgdexSets()
+  const setGuess = bestSetMatch(row['Set'], sets, (s) => s.name)
+  if (!setGuess) return { status: 'nomatch' }
+
+  const setRes = await fetch(`https://api.tcgdex.net/v2/en/sets/${setGuess.id}`)
+  if (!setRes.ok) return { status: 'nomatch' }
+  const setData = await setRes.json()
+
+  const rawNum = (row['Card Number'] || '').split('/')[0].trim()
+  const numNoLeadingZeros = rawNum.replace(/^0+(?=\d)/, '')
+  let card = setData.cards.find((c) => c.localId === rawNum || c.localId === numNoLeadingZeros)
+
+  if (!card) {
+    const nameLower = (row['Product Name'] || '').toLowerCase()
+    const candidates = setData.cards.filter((c) => c.name.toLowerCase() === nameLower)
+    if (candidates.length === 1) card = candidates[0]
+    else if (candidates.length > 1) {
+      return { status: 'review', candidates: candidates.map((c) => ({ label: `${c.name} #${c.localId}`, data: c, resolve: () => resolvePokemonCard(c, setData) })) }
+    }
+  }
+
+  if (!card) return { status: 'nomatch' }
+  return { status: 'matched', ...(await resolvePokemonCard(card, setData)) }
+}
+
+async function resolvePokemonCard(card, setData) {
+  const res = await fetch(`https://api.tcgdex.net/v2/en/cards/${card.id}`)
+  const full = await res.json()
+  return {
+    game: 'pokemon',
+    name: full.name,
+    set_name: setData.name,
+    set_code: setData.id,
+    card_number: full.localId,
+    rarity: full.rarity,
+    image_url: full.image ? `${full.image}/high.png` : null,
+    external_source: 'tcgdex',
+    external_id: full.id,
+    raw_data: full,
+  }
+}
+
+// ---------- MTG (Scryfall) ----------
+let scryfallSets = null
+async function getScryfallSets() {
+  if (!scryfallSets) {
+    const res = await fetch('https://api.scryfall.com/sets')
+    const data = await res.json()
+    scryfallSets = data.data
+  }
+  return scryfallSets
+}
+
+async function matchMTG(row) {
+  const sets = await getScryfallSets()
+  const setGuess = bestSetMatch(row['Set'], sets, (s) => s.name)
+  const num = (row['Card Number'] || '').trim()
+
+  if (setGuess && num) {
+    const res = await fetch(`https://api.scryfall.com/cards/${setGuess.code}/${num}`)
+    if (res.ok) return { status: 'matched', ...toMtgResult(await res.json()) }
+  }
+
+  const q = setGuess
+    ? `!"${row['Product Name']}" set:${setGuess.code}`
+    : `!"${row['Product Name']}"`
+  const res2 = await fetch(`https://api.scryfall.com/cards/search?q=${encodeURIComponent(q)}`)
+  if (res2.ok) {
+    const data = await res2.json()
+    if (data.data?.length === 1) return { status: 'matched', ...toMtgResult(data.data[0]) }
+    if (data.data?.length > 1) {
+      return { status: 'review', candidates: data.data.map((c) => ({ label: `${c.name} (${c.set_name})`, resolve: () => toMtgResult(c) })) }
+    }
+  }
+  return { status: 'nomatch' }
+}
+
+function toMtgResult(card) {
+  return {
+    game: 'mtg',
+    name: card.name,
+    set_name: card.set_name,
+    set_code: card.set,
+    card_number: card.collector_number,
+    rarity: card.rarity,
+    image_url: card.image_uris?.normal || card.card_faces?.[0]?.image_uris?.normal || null,
+    external_source: 'scryfall',
+    external_id: card.id,
+    raw_data: card,
+  }
+}
+
+// ---------- Yu-Gi-Oh (YGOPRODeck) ----------
+async function matchYugioh(row) {
+  const res = await fetch(`https://db.ygoprodeck.com/api/v7/cardinfo.php?name=${encodeURIComponent(row['Product Name'])}`)
+  if (!res.ok) return { status: 'nomatch' }
+  const data = await res.json()
+  const card = data.data?.[0]
+  if (!card) return { status: 'nomatch' }
+  const setInfo = card.card_sets?.find((s) => s.set_code === row['Card Number']) || card.card_sets?.[0]
+  return {
+    status: 'matched',
+    game: 'yugioh',
+    name: card.name,
+    set_name: setInfo?.set_name || row['Set'],
+    set_code: setInfo?.set_code || null,
+    card_number: row['Card Number'],
+    rarity: setInfo?.set_rarity || row['Rarity'],
+    image_url: card.card_images?.[0]?.image_url || null,
+    external_source: 'ygoprodeck',
+    external_id: String(card.id),
+    raw_data: card,
+  }
+}
+
+// ---------- Lorcana (Lorcast) ----------
+let lorcastSets = null
+async function getLorcastSets() {
+  if (!lorcastSets) {
+    const res = await fetch('https://api.lorcast.com/v0/sets')
+    const data = await res.json()
+    lorcastSets = data.results
+  }
+  return lorcastSets
+}
+
+async function matchLorcana(row) {
+  const sets = await getLorcastSets()
+  const setGuess = bestSetMatch(row['Set'], sets, (s) => s.name)
+  const num = (row['Card Number'] || '').split('/')[0].trim()
+
+  if (setGuess && num) {
+    const res = await fetch(`https://api.lorcast.com/v0/cards/${setGuess.code}/${num}`)
+    if (res.ok) return { status: 'matched', ...toLorcanaResult(await res.json(), setGuess) }
+  }
+
+  const res2 = await fetch(`https://api.lorcast.com/v0/cards/search?q=${encodeURIComponent('name:"' + row['Product Name'] + '"')}`)
+  if (res2.ok) {
+    const data = await res2.json()
+    if (data.results?.length === 1) return { status: 'matched', ...toLorcanaResult(data.results[0], setGuess) }
+    if (data.results?.length > 1) {
+      return { status: 'review', candidates: data.results.map((c) => ({ label: `${c.name}${c.version ? ' - ' + c.version : ''} (${c.set?.name || ''})`, resolve: () => toLorcanaResult(c, setGuess) })) }
+    }
+  }
+  return { status: 'nomatch' }
+}
+
+function toLorcanaResult(card, setGuess) {
+  return {
+    game: 'lorcana',
+    name: card.version ? `${card.name} - ${card.version}` : card.name,
+    set_name: setGuess?.name || card.set?.name,
+    set_code: setGuess?.code || card.set?.code,
+    card_number: String(card.collector_number || ''),
+    rarity: card.rarity,
+    image_url: card.image_uris?.digital?.normal || null,
+    external_source: 'lorcast',
+    external_id: card.id,
+    raw_data: card,
+  }
+}
+
+// ---------- driver ----------
+async function startMatching() {
+  const validRows = parsedRows.filter((r) => CATEGORY_TO_GAME[r['Category']])
+  const skipped = parsedRows.length - validRows.length
+  document.getElementById('hidden-count').textContent = skipped ? `${skipped} row(s) skipped (unrecognized category)` : ''
+
+  document.getElementById('results-screen').style.display = 'block'
+  const tbody = document.getElementById('results-body')
+  tbody.innerHTML = ''
+  matchedItems = []
+
+  const progress = document.getElementById('progress')
+
+  for (let i = 0; i < validRows.length; i++) {
+    const row = validRows[i]
+    progress.textContent = `Matching ${i + 1} / ${validRows.length}...`
+    const game = CATEGORY_TO_GAME[row['Category']]
+
+    let result
+    try {
+      if (game === 'pokemon') result = await matchPokemon(row)
+      else if (game === 'mtg') result = await matchMTG(row)
+      else if (game === 'yugioh') result = await matchYugioh(row)
+      else if (game === 'lorcana') result = await matchLorcana(row)
+    } catch (err) {
+      result = { status: 'nomatch' }
+    }
+
+    addResultRow(row, result)
+    await sleep(120) // be polite to public APIs
+  }
+
+  progress.textContent = `Done. ${matchedItems.length} matched automatically.`
+}
+
+function addResultRow(row, result) {
+  const tr = document.createElement('tr')
+  const quantity = Number(row['Quantity']) || 1
+  const variant = row['Variance'] === 'Normal' ? null : row['Variance']
+  const notes = row['Notes'] || null
+
+  const checkboxCell = document.createElement('td')
+  const checkbox = document.createElement('input')
+  checkbox.type = 'checkbox'
+  checkboxCell.appendChild(checkbox)
+
+  const imgCell = document.createElement('td')
+  const statusCell = document.createElement('td')
+
+  function commit(item) {
+    checkbox.checked = true
+    checkbox.onchange = () => {
+      if (checkbox.checked) matchedItems.push(item)
+      else matchedItems = matchedItems.filter((i) => i !== item)
+    }
+    const img = document.createElement('img')
+    img.className = 'thumb'
+    img.src = item.image_url || ''
+    imgCell.appendChild(img)
+    statusCell.innerHTML = '<span class="status-matched">matched</span>'
+    matchedItems.push(item)
+  }
+
+  if (result.status === 'matched') {
+    const item = { ...result, quantity, variant, notes }
+    commit(item)
+  } else if (result.status === 'review' && result.candidates?.length) {
+    checkbox.checked = false
+    const select = document.createElement('select')
+    select.className = 'candidate'
+    select.innerHTML = '<option value="">-- pick a match --</option>' +
+      result.candidates.map((c, idx) => `<option value="${idx}">${c.label}</option>`).join('')
+    select.onchange = async () => {
+      const chosen = result.candidates[select.value]
+      if (!chosen) return
+      const resolved = await chosen.resolve()
+      const item = { ...resolved, quantity, variant, notes }
+      commit(item)
+    }
+    statusCell.innerHTML = '<span class="status-review">needs review</span>'
+    statusCell.appendChild(select)
+  } else {
+    checkbox.checked = false
+    statusCell.innerHTML = '<span class="status-nomatch">no match — skipped</span>'
+  }
+
+  const nameCell = document.createElement('td')
+  nameCell.textContent = row['Product Name']
+  const gameCell = document.createElement('td')
+  gameCell.textContent = row['Category']
+  const setCell = document.createElement('td')
+  setCell.textContent = row['Set']
+  const variantCell = document.createElement('td')
+  variantCell.textContent = variant || 'Normal'
+  const qtyCell = document.createElement('td')
+  qtyCell.textContent = quantity
+
+  tr.append(checkboxCell, imgCell, nameCell, gameCell, setCell, variantCell, qtyCell, statusCell)
+  document.getElementById('results-body').appendChild(tr)
+}
+
+async function submitImport() {
+  const resultBox = document.getElementById('import-result')
+  resultBox.style.display = 'block'
+  resultBox.textContent = `Importing ${matchedItems.length} item(s)...`
+
+  const res = await fetch('/api/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: matchedItems }),
+  })
+  const data = await res.json()
+  if (res.ok) {
+    resultBox.textContent = `Imported ${data.imported} card(s) into "Unsorted".` +
+      (data.errors?.length ? ` ${data.errors.length} error(s): ${data.errors.map((e) => e.name).join(', ')}` : '')
+  } else {
+    resultBox.textContent = `Import failed: ${data.error}`
+  }
+}
+</script>
+</body>
+</html>
